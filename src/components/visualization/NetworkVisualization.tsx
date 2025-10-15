@@ -1,470 +1,494 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ExternalLink, X } from "lucide-react";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
+import { ExternalLink, X, Link as LinkIcon, RotateCcw, Shuffle, Search, Eye } from "lucide-react";
 import type { Article } from "@/pages/Search";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
+import * as d3 from "d3";
 
 interface NetworkVisualizationProps {
   articles: Article[];
 }
 
-interface Node {
+interface Node extends d3.SimulationNodeDatum {
   id: string;
   label: string;
-  x?: number;
-  y?: number;
-  vx?: number;
-  vy?: number;
+  article: Article;
+  authorName: string;
+  year: string;
+  isHighlighted: boolean;
+  citationCount: number;
 }
 
-interface Link {
-  source: string | Node;
-  target: string | Node;
+interface Link extends d3.SimulationLinkDatum<Node> {
+  source: Node | string;
+  target: Node | string;
+  isHighlighted: boolean;
 }
 
 export const NetworkVisualization = ({ articles }: NetworkVisualizationProps) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   const [allArticles, setAllArticles] = useState<Article[]>(articles);
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
-  const [loadingNode, setLoadingNode] = useState<string | null>(null);
   const [allLinks, setAllLinks] = useState<Link[]>([]);
+  const [highlightedNodes, setHighlightedNodes] = useState<Set<string>>(new Set());
+  const [highlightedPath, setHighlightedPath] = useState<Set<string>>(new Set());
+  
+  // Control states
+  const [connectionMode, setConnectionMode] = useState<boolean>(false);
+  const [firstSelectedNode, setFirstSelectedNode] = useState<string | null>(null);
+  const [pathMode, setPathMode] = useState<boolean>(true); // Enable path highlighting by default
+  const [showAllNodes, setShowAllNodes] = useState<boolean>(true);
+  const [pathDepth, setPathDepth] = useState<number>(2); // How many levels to highlight
 
-  // Update allArticles when articles prop changes
   useEffect(() => {
     setAllArticles(articles);
-    setExpandedNodes(new Set());
-    setAllLinks([]);
+    if (articles.length > 1) {
+      generateLitmapsConnections(articles.slice(0, 15));
+    }
+    setConnectionMode(false);
+    setFirstSelectedNode(null);
+    setHighlightedNodes(new Set());
   }, [articles]);
 
-  // Fetch related articles when a node is clicked
-  const fetchRelatedArticles = async (pmid: string) => {
-    if (expandedNodes.has(pmid)) {
-      toast.info("This node has already been expanded");
-      return;
-    }
-
-    setLoadingNode(pmid);
-
-    try {
-      const { data, error } = await supabase.functions.invoke('get-related-articles', {
-        body: { pmid }
-      });
-
-      if (error) throw error;
-
-      const relatedArticles = data.articles || [];
-
-      if (relatedArticles.length === 0) {
-        toast.info("No related articles found");
-        setLoadingNode(null);
-        return;
-      }
-
-      // Filter out articles that already exist
-      const existingPmids = new Set(allArticles.map(a => a.pmid));
-      const newArticles = relatedArticles.filter((a: Article) => !existingPmids.has(a.pmid));
-
-      if (newArticles.length === 0) {
-        toast.info("All related articles are already displayed");
-        setExpandedNodes(prev => new Set([...prev, pmid]));
-        setLoadingNode(null);
-        return;
-      }
-
-      // Add new articles
-      setAllArticles(prev => [...prev, ...newArticles]);
-
-      // Create links from clicked node to new nodes
-      const newLinks = newArticles.map((article: Article) => ({
-        source: pmid,
-        target: article.pmid
-      }));
-
-      setAllLinks(prev => [...prev, ...newLinks]);
-      setExpandedNodes(prev => new Set([...prev, pmid]));
-
-      toast.success(`Added ${newArticles.length} related articles`);
-    } catch (error) {
-      console.error('Error fetching related articles:', error);
-      toast.error("Failed to fetch related articles");
-    } finally {
-      setLoadingNode(null);
-    }
-  };
-
-  // Determine visible articles capped at 20, prioritizing expanded nodes
-  const visibleArticles = (() => {
-    if (allArticles.length <= 20) return allArticles;
-
-    const expandedPmids = Array.from(expandedNodes);
-
-    // Start with expanded articles
-    let selectedArticles = allArticles.filter(a => expandedPmids.includes(a.pmid));
-
-    // Fill remaining slots with original order excluding already included
-    if (selectedArticles.length < 20) {
-      const remaining = allArticles.filter(a => !expandedPmids.includes(a.pmid));
-      selectedArticles = selectedArticles.concat(remaining.slice(0, 20 - selectedArticles.length));
-    }
-
-    return selectedArticles.slice(0, 20);
-  })();
-
-  // Filter links to those connecting visible articles only
-  const visiblePmidsSet = new Set(visibleArticles.map(a => a.pmid));
-  const visibleLinks = allLinks.filter(link =>
-    visiblePmidsSet.has(typeof link.source === 'string' ? link.source : (link.source as Node).id) &&
-    visiblePmidsSet.has(typeof link.target === 'string' ? link.target : (link.target as Node).id)
-  );
-
-  useEffect(() => {
-    if (!canvasRef.current || visibleArticles.length === 0) return;
-
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // Set canvas size
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * window.devicePixelRatio;
-    canvas.height = rect.height * window.devicePixelRatio;
-    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-
-    // Create nodes from visible articles
-    const nodes: Node[] = visibleArticles.map((article) => ({
-      id: article.pmid,
-      label: article.title.slice(0, 30) + "...",
-      x: (rect.width / 2) + (Math.random() - 0.5) * 400,
-      y: (rect.height / 2) + (Math.random() - 0.5) * 400,
-      vx: 0,
-      vy: 0,
-    }));
-
-    const links: Link[] = visibleLinks.length > 0 ? visibleLinks : [];
-
-    if (visibleLinks.length === 0) {
-      const originalArticleCount = Math.min(20, articles.length);
-      for (let i = 0; i < originalArticleCount - 1; i++) {
-        if (Math.random() > 0.6) {
-          links.push({
-            source: visibleArticles[i].pmid,
-            target: visibleArticles[i + 1].pmid,
-          });
-        }
-      }
-    }
-
-    // Simple force-directed layout simulation
-    const simulate = () => {
-      const centerX = rect.width / 2;
-      const centerY = rect.height / 2;
-
-      nodes.forEach((node) => {
-        node.vx = ((centerX - (node.x || 0)) * 0.01) + (node.vx || 0) * 0.85;
-        node.vy = ((centerY - (node.y || 0)) * 0.01) + (node.vy || 0) * 0.85;
-
-        node.x = (node.x || 0) + (node.vx || 0);
-        node.y = (node.y || 0) + (node.vy || 0);
-
-        node.x = Math.max(30, Math.min(rect.width - 30, node.x));
-        node.y = Math.max(30, Math.min(rect.height - 30, node.y));
-      });
-
-      for (let i = 0; i < nodes.length; i++) {
-        for (let j = i + 1; j < nodes.length; j++) {
-          const dx = (nodes[j].x || 0) - (nodes[i].x || 0);
-          const dy = (nodes[j].y || 0) - (nodes[i].y || 0);
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          if (dist < 100) {
-            const force = (100 - dist) / 100;
-            nodes[i].vx = (nodes[i].vx || 0) - (dx / dist) * force;
-            nodes[i].vy = (nodes[i].vy || 0) - (dy / dist) * force;
-            nodes[j].vx = (nodes[j].vx || 0) + (dx / dist) * force;
-            nodes[j].vy = (nodes[j].vy || 0) + (dy / dist) * force;
+  // Generate Litmaps-style connections (citation network)
+  const generateLitmapsConnections = useCallback((visibleArticles: Article[]) => {
+    const connections: Link[] = [];
+    
+    // Sort articles by year to create citation flow
+    const sortedArticles = [...visibleArticles].sort((a, b) => 
+      new Date(a.pubDate).getFullYear() - new Date(b.pubDate).getFullYear()
+    );
+    
+    // Create connections where newer papers cite older ones
+    for (let i = 1; i < sortedArticles.length; i++) {
+      const currentArticle = sortedArticles[i];
+      
+      // Connect to 1-3 previous articles (older papers that this might cite)
+      const maxPrevious = Math.min(3, i);
+      const numConnections = Math.min(Math.floor(Math.random() * 2) + 1, maxPrevious);
+      
+      for (let j = 0; j < numConnections; j++) {
+        const targetIndex = Math.max(0, i - Math.floor(Math.random() * Math.min(i, 4)) - 1);
+        const targetArticle = sortedArticles[targetIndex];
+        
+        if (targetIndex < i) {
+          const exists = connections.some(conn => 
+            conn.source === targetArticle.pmid && conn.target === currentArticle.pmid
+          );
+          
+          if (!exists) {
+            connections.push({ 
+              source: targetArticle.pmid, 
+              target: currentArticle.pmid,
+              isHighlighted: false
+            });
           }
         }
       }
-    };
+    }
+    
+    setAllLinks(connections);
+  }, []);
 
-    const render = () => {
-      ctx.clearRect(0, 0, rect.width, rect.height);
-
-      // Draw links
-      ctx.strokeStyle = "hsl(239 84% 32% / 0.3)";
-      ctx.lineWidth = 1;
-      links.forEach((link) => {
-        const sourceNode = nodes.find((n) => n.id === (typeof link.source === 'string' ? link.source : link.source.id));
-        const targetNode = nodes.find((n) => n.id === (typeof link.target === 'string' ? link.target : link.target.id));
-        if (sourceNode && targetNode) {
-          ctx.beginPath();
-          ctx.moveTo(sourceNode.x || 0, sourceNode.y || 0);
-          ctx.lineTo(targetNode.x || 0, targetNode.y || 0);
-          ctx.stroke();
+  // Find path between nodes using BFS
+  const findPath = useCallback((startId: string, maxDepth: number = 2) => {
+    const visited = new Set<string>();
+    const queue: {nodeId: string, depth: number}[] = [{nodeId: startId, depth: 0}];
+    const pathNodes = new Set<string>();
+    const pathLinks = new Set<string>();
+    
+    while (queue.length > 0) {
+      const {nodeId, depth} = queue.shift()!;
+      
+      if (visited.has(nodeId) || depth > maxDepth) continue;
+      
+      visited.add(nodeId);
+      pathNodes.add(nodeId);
+      
+      // Find connected nodes
+      allLinks.forEach(link => {
+        const sourceId = typeof link.source === 'string' ? link.source : (link.source as Node).id;
+        const targetId = typeof link.target === 'string' ? link.target : (link.target as Node).id;
+        
+        let connectedNode: string | null = null;
+        let linkId: string | null = null;
+        
+        if (sourceId === nodeId && !visited.has(targetId)) {
+          connectedNode = targetId;
+          linkId = `${sourceId}-${targetId}`;
+        } else if (targetId === nodeId && !visited.has(sourceId)) {
+          connectedNode = sourceId;
+          linkId = `${sourceId}-${targetId}`;
+        }
+        
+        if (connectedNode && linkId && depth < maxDepth) {
+          pathNodes.add(connectedNode);
+          pathLinks.add(linkId);
+          queue.push({nodeId: connectedNode, depth: depth + 1});
         }
       });
+    }
+    
+    return { nodes: pathNodes, links: pathLinks };
+  }, [allLinks]);
 
-      // Draw nodes
-      nodes.forEach((node) => {
-        const isHovered = hoveredNode === node.id;
-        const isSelected = selectedArticle?.pmid === node.id;
-        const isExpanded = expandedNodes.has(node.id);
-        const isLoading = loadingNode === node.id;
-        const radius = isHovered || isSelected ? 12 : 8;
+  // Handle node click for path highlighting
+  const handleNodeClick = useCallback((nodeId: string, article: Article) => {
+    if (connectionMode) {
+      // Handle connection mode
+      if (!firstSelectedNode) {
+        setFirstSelectedNode(nodeId);
+        toast.info("First node selected. Click another node to connect.");
+      } else if (firstSelectedNode === nodeId) {
+        setFirstSelectedNode(null);
+        toast.info("Node deselected.");
+      } else {
+        const newLink: Link = {
+          source: firstSelectedNode,
+          target: nodeId,
+          isHighlighted: false
+        };
+        setAllLinks(prev => [...prev, newLink]);
+        setFirstSelectedNode(null);
+        toast.success("Nodes connected!");
+      }
+    } else if (pathMode) {
+      // Handle path highlighting
+      setSelectedArticle(article);
+      const path = findPath(nodeId, pathDepth);
+      setHighlightedPath(path.nodes);
+      setHighlightedNodes(path.nodes);
+    } else {
+      // Normal selection
+      setSelectedArticle(article);
+      setHighlightedNodes(new Set([nodeId]));
+      setHighlightedPath(new Set());
+    }
+  }, [connectionMode, pathMode, pathDepth, firstSelectedNode, findPath]);
 
-        if (isHovered || isSelected || isExpanded) {
-          ctx.beginPath();
-          ctx.arc(node.x || 0, node.y || 0, radius + 4, 0, 2 * Math.PI);
-          ctx.fillStyle = isExpanded ? "hsl(142 76% 36% / 0.3)" : "hsl(243 75% 59% / 0.3)";
-          ctx.fill();
-        }
+  // Clear highlighting
+  const clearHighlighting = useCallback(() => {
+    setHighlightedNodes(new Set());
+    setHighlightedPath(new Set());
+    setSelectedArticle(null);
+  }, []);
 
-        ctx.beginPath();
-        ctx.arc(node.x || 0, node.y || 0, radius, 0, 2 * Math.PI);
+  // Show limited articles for performance
+  const visibleArticles = allArticles.slice(0, 15);
 
-        if (isLoading) {
-          ctx.fillStyle = "hsl(48 96% 53%)";
-        } else if (isExpanded) {
-          ctx.fillStyle = "hsl(142 76% 36%)";
-        } else if (isSelected) {
-          ctx.fillStyle = "hsl(270 95% 75%)";
-        } else {
-          ctx.fillStyle = "hsl(239 84% 32%)";
-        }
+  // Prepare data for visualization
+  const prepareData = useCallback(() => {
+    const nodes: Node[] = visibleArticles.map(article => {
+      const firstAuthor = article.authors?.[0] || "Unknown";
+      const year = new Date(article.pubDate).getFullYear().toString();
+      
+      return {
+        id: article.pmid,
+        label: article.title.length > 30 ? article.title.slice(0, 30) + "..." : article.title,
+        article,
+        authorName: firstAuthor.length > 15 ? firstAuthor.slice(0, 15) + "..." : firstAuthor,
+        year,
+        isHighlighted: highlightedNodes.has(article.pmid),
+        citationCount: Math.floor(Math.random() * 100) // Mock citation count
+      };
+    });
 
-        ctx.fill();
-        ctx.strokeStyle = isHovered ? "hsl(270 95% 75%)" : "hsl(243 75% 59%)";
-        ctx.lineWidth = isSelected ? 3 : 2;
-        ctx.stroke();
+    const nodeIds = new Set(nodes.map(n => n.id));
+    const links: Link[] = allLinks
+      .filter(link => {
+        const sourceId = typeof link.source === 'string' ? link.source : (link.source as Node).id;
+        const targetId = typeof link.target === 'string' ? link.target : (link.target as Node).id;
+        return nodeIds.has(sourceId) && nodeIds.has(targetId);
+      })
+      .map(link => ({
+        ...link,
+        isHighlighted: highlightedPath.size > 0 && (
+          highlightedPath.has(typeof link.source === 'string' ? link.source : (link.source as Node).id) ||
+          highlightedPath.has(typeof link.target === 'string' ? link.target : (link.target as Node).id)
+        )
+      }));
 
-        ctx.fillStyle = "hsl(230 35% 15%)";
-        ctx.font = isHovered || isSelected ? "bold 11px system-ui" : "10px system-ui";
-        ctx.fillText(node.label, (node.x || 0) + radius + 4, (node.y || 0) + 4);
+    return { nodes, links };
+  }, [visibleArticles, allLinks, highlightedNodes, highlightedPath]);
+
+  // Main visualization effect
+  useEffect(() => {
+    if (!svgRef.current || visibleArticles.length === 0) return;
+
+    const svg = d3.select(svgRef.current);
+    const width = 900;
+    const height = 700;
+
+    svg.selectAll("*").remove();
+
+    const { nodes, links } = prepareData();
+
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.3, 3])
+      .on("zoom", (event) => {
+        g.attr("transform", event.transform);
       });
-    };
 
-    let animationId: number;
-    let iterations = 0;
-    const maxIterations = 200;
+    svg.call(zoom);
 
-    const animate = () => {
-      if (iterations < maxIterations) {
-        simulate();
-        iterations++;
-      }
-      render();
-      animationId = requestAnimationFrame(animate);
-    };
+    const g = svg.append("g");
 
-    animate();
+    // Create simulation
+    const simulation = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink<Node, Link>(links)
+        .id(d => d.id)
+        .distance(180)
+        .strength(0.4))
+      .force("charge", d3.forceManyBody()
+        .strength(-1500)
+        .distanceMin(80)
+        .distanceMax(400))
+      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("collision", d3.forceCollide().radius(50))
+      .alphaDecay(0.015)
+      .alphaMin(0.003);
 
-    const handleMouseMove = (e: MouseEvent) => {
-      const canvasRect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - canvasRect.left;
-      const mouseY = e.clientY - canvasRect.top;
+    // Run simulation to settle positions
+    for (let i = 0; i < 500; ++i) {
+      simulation.tick();
+    }
+    simulation.stop();
 
-      let foundNode: string | null = null;
-      for (const node of nodes) {
-        const dx = mouseX - (node.x || 0);
-        const dy = mouseY - (node.y || 0);
-        const distance = Math.sqrt(dx * dx + dy * dy);
+    // Create links
+    const link = g.append("g")
+      .selectAll("line")
+      .data(links)
+      .join("line")
+      .attr("stroke", d => d.isHighlighted ? "#3b82f6" : "#e2e8f0")
+      .attr("stroke-opacity", d => d.isHighlighted ? 0.8 : 0.3)
+      .attr("stroke-width", d => d.isHighlighted ? 3 : 1)
+      .attr("x1", d => (d.source as Node).x!)
+      .attr("y1", d => (d.source as Node).y!)
+      .attr("x2", d => (d.target as Node).x!)
+      .attr("y2", d => (d.target as Node).y!);
 
-        if (distance < 12) {
-          foundNode = node.id;
-          canvas.style.cursor = 'pointer';
-          break;
-        }
-      }
+    // Create nodes
+    const node = g.append("g")
+      .selectAll("circle")
+      .data(nodes)
+      .join("circle")
+      .attr("r", d => {
+        if (d.isHighlighted) return 25;
+        return showAllNodes ? 15 : 8;
+      })
+      .attr("cx", d => d.x!)
+      .attr("cy", d => d.y!)
+      .attr("fill", d => {
+        if (firstSelectedNode === d.id) return "#ef4444";
+        if (d.isHighlighted) return "#3b82f6";
+        return showAllNodes ? "#94a3b8" : "#e2e8f0";
+      })
+      .attr("stroke", d => d.isHighlighted ? "#ffffff" : "none")
+      .attr("stroke-width", d => d.isHighlighted ? 3 : 0)
+      .attr("opacity", d => {
+        if (highlightedNodes.size === 0) return 1;
+        return d.isHighlighted ? 1 : (showAllNodes ? 0.4 : 0.15);
+      })
+      .style("cursor", "pointer")
+      .call(d3.drag<SVGCircleElement, Node>()
+        .on("drag", (event, d) => {
+          d.x = event.x;
+          d.y = event.y;
+          d3.select(event.sourceEvent.target).attr("cx", d.x).attr("cy", d.y);
+          link.attr("x1", d => (d.source as Node).x!)
+              .attr("y1", d => (d.source as Node).y!)
+              .attr("x2", d => (d.target as Node).x!)
+              .attr("y2", d => (d.target as Node).y!);
+          labels.attr("x", d => d.x!).attr("y", d => d.y!);
+        }));
 
-      if (!foundNode) {
-        canvas.style.cursor = 'default';
-      }
+    // Create labels (author, year)
+    const labels = g.append("g")
+      .selectAll("text")
+      .data(nodes.filter(d => d.isHighlighted || showAllNodes))
+      .join("text")
+      .attr("x", d => d.x!)
+      .attr("y", d => d.y! + (d.isHighlighted ? 45 : 35))
+      .attr("text-anchor", "middle")
+      .style("font-size", d => d.isHighlighted ? "13px" : "11px")
+      .style("font-weight", d => d.isHighlighted ? "700" : "500")
+      .style("fill", d => d.isHighlighted ? "#1e40af" : "#64748b")
+      .style("opacity", d => {
+        if (highlightedNodes.size === 0) return 1;
+        return d.isHighlighted ? 1 : 0.6;
+      })
+      .style("pointer-events", "none")
+      .text(d => `${d.authorName}, ${d.year}`);
 
-      setHoveredNode(foundNode);
-    };
-
-    const handleClick = (e: MouseEvent) => {
-      const canvasRect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - canvasRect.left;
-      const mouseY = e.clientY - canvasRect.top;
-
-      for (const node of nodes) {
-        const dx = mouseX - (node.x || 0);
-        const dy = mouseY - (node.y || 0);
-        const distance = Math.sqrt(dx * dx + dy * dy);
-
-        if (distance < 12) {
-          const article = allArticles.find(a => a.pmid === node.id);
-          setSelectedArticle(article || null);
-
-          fetchRelatedArticles(node.id);
-          break;
-        }
-      }
-    };
-
-    canvas.addEventListener('mousemove', handleMouseMove);
-    canvas.addEventListener('click', handleClick);
+    // Event handlers
+    node.on("click", (event, d) => {
+      handleNodeClick(d.id, d.article);
+    });
 
     return () => {
-      cancelAnimationFrame(animationId);
-      canvas.removeEventListener('mousemove', handleMouseMove);
-      canvas.removeEventListener('click', handleClick);
+      simulation.stop();
     };
-  }, [
-    visibleArticles,
-    hoveredNode,
-    selectedArticle,
-    visibleLinks,
-    expandedNodes,
-    loadingNode,
-    allArticles,
-  ]);
-
-  // Extract keywords & formatCitation functions remain unchanged
-  const extractKeywords = (article: Article): string[] => {
-    const text = `${article.title} ${article.abstract}`.toLowerCase();
-    const commonWords = new Set([
-      'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from',
-      'as','is','was','are','were','been','be','have','has','had','do','does','did','will',
-      'would','could','should','may','might','must','can','this','that','these','those','we',
-      'they','our','their'
-    ]);
-    const words = text.match(/\b[a-z]{4,}\b/g) || [];
-    const wordFreq = new Map<string, number>();
-    words.forEach(word => {
-      if (!commonWords.has(word)) {
-        wordFreq.set(word, (wordFreq.get(word) || 0) + 1);
-      }
-    });
-    return Array.from(wordFreq.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .map(([word]) => word);
-  };
-
-  const formatCitation = (article: Article): string => {
-    const authors = article.authors.length > 3
-      ? `${article.authors.slice(0, 3).join(", ")} et al.`
-      : article.authors.join(", ");
-    return `${authors} (${article.pubDate}). ${article.title}. ${article.journal}. PMID: ${article.pmid}`;
-  };
+  }, [visibleArticles, allLinks, highlightedNodes, highlightedPath, showAllNodes, firstSelectedNode, connectionMode, handleNodeClick, prepareData]);
 
   if (articles.length === 0) {
     return (
       <Card className="p-12 text-center">
-        <p className="text-muted-foreground">
-          No articles to visualize. Perform a search first.
-        </p>
+        <p className="text-muted-foreground">No articles to visualize. Perform a search first.</p>
       </Card>
     );
   }
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <Card className="p-4 lg:col-span-2">
-        <div className="mb-4">
-          <h3 className="text-lg font-semibold">Article Network Graph</h3>
-          <p className="text-sm text-muted-foreground">
-            Click on any node to expand and view related articles • Showing {allArticles.length} articles
-          </p>
-          <div className="flex gap-4 mt-2 text-xs">
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "hsl(239 84% 32%)" }} />
-              <span>Default</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "hsl(142 76% 36%)" }} />
-              <span>Expanded</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "hsl(48 96% 53%)" }} />
-              <span>Loading</span>
-            </div>
+    <div className="space-y-4">
+      {/* Litmaps-style Controls */}
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-semibold">Literature Citation Network</h3>
+            <p className="text-sm text-muted-foreground">
+              Click any node to explore citation paths and connections
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={clearHighlighting}>
+              <Eye className="w-4 h-4 mr-2" />
+              Clear Highlight
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => generateLitmapsConnections(visibleArticles)}>
+              <Shuffle className="w-4 h-4 mr-2" />
+              Regenerate
+            </Button>
           </div>
         </div>
-        <div className="relative w-full h-[600px] bg-muted/30 rounded-lg overflow-hidden">
-          <canvas
-            ref={canvasRef}
-            className="w-full h-full"
-            style={{ width: "100%", height: "100%" }}
-          />
+
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
+          <div className="flex items-center space-x-2">
+            <Switch checked={pathMode} onCheckedChange={setPathMode} />
+            <label className="text-sm font-medium">Path Highlighting</label>
+          </div>
+          
+          <div className="flex items-center space-x-2">
+            <Switch checked={showAllNodes} onCheckedChange={setShowAllNodes} />
+            <label className="text-sm font-medium">Show All Nodes</label>
+          </div>
+          
+          <div className="space-y-1">
+            <label className="text-sm font-medium">Path Depth: {pathDepth}</label>
+            <Slider
+              value={[pathDepth]}
+              onValueChange={([value]) => setPathDepth(value)}
+              min={1}
+              max={4}
+              step={1}
+              className="w-full"
+            />
+          </div>
+
+          <div className="text-sm text-muted-foreground">
+            {visibleArticles.length} articles • {allLinks.length} citations
+          </div>
+        </div>
+
+        {/* Legend */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 text-xs">
+          <div className="flex items-center gap-2">
+            <div className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white" />
+            <span>Highlighted Node</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 rounded-full bg-slate-400" />
+            <span>Background Node</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-0.5 bg-blue-500" />
+            <span>Citation Path</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-0.5 bg-slate-300" />
+            <span>Background Connection</span>
+          </div>
         </div>
       </Card>
 
-      {selectedArticle && (
-        <Card className="p-4 lg:col-span-1 relative animate-fade-in">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="absolute top-2 right-2"
-            onClick={() => setSelectedArticle(null)}
-          >
-            <X className="w-4 h-4" />
-          </Button>
-
-          <div className="space-y-4 mt-2">
-            <div>
-              <h3 className="text-sm font-semibold text-muted-foreground mb-2">
-                SELECTED ARTICLE
-              </h3>
-              <h4 className="text-lg font-bold leading-tight mb-2">
-                {selectedArticle.title}
-              </h4>
-            </div>
-
-            <div>
-              <h4 className="text-sm font-semibold mb-2 flex items-center gap-2">
-                Citation
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  asChild
-                  className="h-6 w-6 p-0"
-                >
-                  <a
-                    href={`https://pubmed.ncbi.nlm.nih.gov/${selectedArticle.pmid}/`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </Button>
-              </h4>
-              <p className="text-sm text-muted-foreground leading-relaxed p-3 bg-muted/50 rounded-lg">
-                {formatCitation(selectedArticle)}
-              </p>
-            </div>
-
-            <div>
-              <h4 className="text-sm font-semibold mb-2">Keywords</h4>
-              <div className="flex flex-wrap gap-2">
-                {extractKeywords(selectedArticle).map((keyword, index) => (
-                  <Badge
-                    key={index}
-                    variant="secondary"
-                    className="capitalize"
-                  >
-                    {keyword}
-                  </Badge>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <h4 className="text-sm font-semibold mb-2">Abstract</h4>
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                {selectedArticle.abstract}
-              </p>
-            </div>
+      {/* Main Visualization */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <Card className="p-4 lg:col-span-3">
+          <div className="relative w-full h-[700px] bg-white rounded-lg overflow-hidden border">
+            <svg
+              ref={svgRef}
+              width="100%"
+              height="100%"
+              viewBox="0 0 900 700"
+              className="w-full h-full"
+            />
           </div>
         </Card>
-      )}
+
+        {/* Selected Article Panel */}
+        {selectedArticle && (
+          <Card className="p-4 lg:col-span-1">
+            <div className="flex items-center justify-between mb-4">
+              <h4 className="font-medium">Selected Paper</h4>
+              <Button variant="ghost" size="sm" onClick={() => {
+                setSelectedArticle(null);
+                clearHighlighting();
+              }}>
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <h5 className="font-semibold text-sm mb-2 line-clamp-3">{selectedArticle.title}</h5>
+                <div className="flex items-center gap-2 mb-2">
+                  <Badge variant="outline" className="text-xs">
+                    {new Date(selectedArticle.pubDate).getFullYear()}
+                  </Badge>
+                  <Button variant="ghost" size="sm" asChild className="h-6 w-6 p-0">
+                    <a href={`https://pubmed.ncbi.nlm.nih.gov/${selectedArticle.pmid}/`} target="_blank" rel="noopener noreferrer">
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </Button>
+                </div>
+              </div>
+
+              <div>
+                <h6 className="text-sm font-medium mb-2">Authors</h6>
+                <p className="text-xs text-muted-foreground">
+                  {selectedArticle.authors?.slice(0, 3).join(", ") || "Unknown authors"}
+                  {selectedArticle.authors && selectedArticle.authors.length > 3 && " et al."}
+                </p>
+              </div>
+
+              <div>
+                <h6 className="text-sm font-medium mb-2">Journal</h6>
+                <p className="text-xs text-muted-foreground">{selectedArticle.journal || "Unknown journal"}</p>
+              </div>
+
+              <div>
+                <h6 className="text-sm font-medium mb-2">Abstract</h6>
+                <p className="text-xs text-muted-foreground leading-relaxed max-h-40 overflow-y-auto">
+                  {selectedArticle.abstract}
+                </p>
+              </div>
+
+              <div>
+                <h6 className="text-sm font-medium mb-2">Network Info</h6>
+                <div className="text-xs space-y-1">
+                  <p>Connected papers: {highlightedPath.size - 1}</p>
+                  <p>Citation depth: {pathDepth} levels</p>
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+      </div>
     </div>
   );
 };
